@@ -6567,15 +6567,18 @@ ShutdownXLOG(int code, Datum arg)
 	else
 	{
 		/*
+		 * Ensure the checkpoint record goes in the current XLOG and
+		 * gets archived (if enabled).
+		 */
+		CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
+
+		/*
 		 * If archiving is enabled, rotate the last XLOG file so that all the
 		 * remaining records are archived (postmaster wakes up the archiver
-		 * process one more time at the end of shutdown). The checkpoint
-		 * record will go to the next XLOG file and won't be archived (yet).
+		 * process one more time at the end of shutdown).
 		 */
 		if (XLogArchivingActive())
 			RequestXLogSwitch(false);
-
-		CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
 	}
 }
 
