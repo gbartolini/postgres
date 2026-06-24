@@ -20,8 +20,8 @@
  * When enabling checksums in an online cluster, data_checksums will be set to
  * "inprogress-on" which signals that write operations MUST compute and write
  * the checksum on the data page, but during reading the checksum SHALL NOT be
- * verified. This ensures that all objects created during when checksums are
- * being enabled will have checksums set, but reads won't fail due to missing or
+ * verified. This ensures that all objects created while checksums are being
+ * enabled will have checksums set, but reads won't fail due to missing or
  * invalid checksums. Invalid checksums can be present in case the cluster had
  * checksums enabled, then disabled them and updated the page while they were
  * disabled.
@@ -299,33 +299,28 @@ typedef struct DataChecksumsStateStruct
 	bool		launcher_running;
 
 	/*
-	 * Is a worker process currently running?  This is set by the worker
-	 * launcher when it starts waiting for a worker process to finish.
+	 * PID of the worker process, if it's currently running, of InvalidPid if
+	 * none. This is set by the worker launcher when it starts waiting for a
+	 * worker process to finish.
 	 */
-	int			worker_pid;
+	pid_t		worker_pid;
 
 	/*
-	 * These fields indicate the target state that the launcher is currently
-	 * working towards. They can be different from the corresponding launch_*
+	 * These fields indicate the target state that the worker is currently
+	 * running with.  They can be different from the corresponding launch_*
 	 * fields, if a new pg_enable/disable_data_checksums() call was made while
-	 * the launcher/worker was already running.
-	 *
-	 * The below members are set when the launcher starts, and are only
-	 * accessed read-only by the single worker. Thus, we can access these
-	 * without a lock. If multiple workers, or dynamic cost parameters, are
-	 * supported at some point then this would need to be revisited.
+	 * the launcher/worker was already running.  The worker will periodically
+	 * check if new cost settings have been requested, and if so will copy
+	 * them from the launch_* fields and reset cost throttling to match the
+	 * new values.
 	 */
 	DataChecksumsWorkerOperation operation;
 	int			cost_delay;
 	int			cost_limit;
 
 	/*
-	 * Signaling between the launcher and the worker process.
-	 *
-	 * As there is only a single worker, and the launcher won't read these
-	 * until the worker exits, they can be accessed without the need for a
-	 * lock. If multiple workers are supported then this will have to be
-	 * revisited.
+	 * Signaling between the launcher and the worker process. Protected by
+	 * DataChecksumsWorkerLock.
 	 */
 
 	/* result, set by worker before exiting */
@@ -599,9 +594,9 @@ StartDataChecksumsWorkerLauncher(DataChecksumsWorkerOperation op,
 	 *
 	 * If the launcher is currently busy enabling the checksums, and we want
 	 * them disabled (or vice versa), the launcher will notice that at latest
-	 * when it's about to exit, and will loop back process the new request. So
-	 * if the launcher is already running, we don't need to do anything more
-	 * here to abort it.
+	 * when it's about to exit, and will loop back to process the new request.
+	 * So if the launcher is already running, we don't need to do anything
+	 * more here to abort it.
 	 *
 	 * If you call pg_enable/disable_data_checksums() twice in a row, before
 	 * the launcher has had a chance to start up, we still end up launching it
@@ -626,8 +621,8 @@ StartDataChecksumsWorkerLauncher(DataChecksumsWorkerOperation op,
 		bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
 		snprintf(bgw.bgw_library_name, BGW_MAXLEN, "postgres");
 		snprintf(bgw.bgw_function_name, BGW_MAXLEN, "DataChecksumsWorkerLauncherMain");
-		snprintf(bgw.bgw_name, BGW_MAXLEN, "datachecksum launcher");
-		snprintf(bgw.bgw_type, BGW_MAXLEN, "datachecksum launcher");
+		snprintf(bgw.bgw_name, BGW_MAXLEN, "datachecksums launcher");
+		snprintf(bgw.bgw_type, BGW_MAXLEN, "datachecksums launcher");
 		bgw.bgw_restart_time = BGW_NEVER_RESTART;
 		bgw.bgw_notify_pid = MyProcPid;
 		bgw.bgw_main_arg = (Datum) 0;
@@ -710,10 +705,7 @@ ProcessSingleRelationFork(Relation reln, ForkNumber forkNum, BufferAccessStrateg
 
 		UnlockReleaseBuffer(buf);
 
-		/*
-		 * This is the only place where we check if we are asked to abort, the
-		 * abortion will bubble up from here.
-		 */
+		/* Check if we are asked to abort, the abortion will bubble up. */
 		Assert(operation == ENABLE_DATACHECKSUMS);
 		LWLockAcquire(DataChecksumsWorkerLock, LW_SHARED);
 		if (DataChecksumState->launch_operation == DISABLE_DATACHECKSUMS)
@@ -813,8 +805,8 @@ ProcessDatabase(DataChecksumsWorkerDatabase *db)
 	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
 	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "postgres");
 	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "%s", "DataChecksumsWorkerMain");
-	snprintf(bgw.bgw_name, BGW_MAXLEN, "datachecksum worker");
-	snprintf(bgw.bgw_type, BGW_MAXLEN, "datachecksum worker");
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "datachecksums worker");
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "datachecksums worker");
 	bgw.bgw_restart_time = BGW_NEVER_RESTART;
 	bgw.bgw_notify_pid = MyProcPid;
 	bgw.bgw_main_arg = ObjectIdGetDatum(db->dboid);
@@ -924,8 +916,8 @@ ProcessDatabase(DataChecksumsWorkerDatabase *db)
  * performed checksum operations exits. A launcher process which is exiting due
  * to a duplicate started launcher does not need to perform any cleanup and
  * this function should not be called. Otherwise, we need to clean up the abort
- * flag to ensure that processing started again if it was previously aborted
- * (note: started again, *not* restarted from where it left off).
+ * flag to ensure that processing can be started again if it was previously
+ * aborted (note: started again, *not* restarted from where it left off).
  */
 static void
 launcher_exit(int code, Datum arg)
@@ -1011,7 +1003,7 @@ WaitForAllTransactionsToFinish(void)
 		/* Oldest running xid is older than us, so wait */
 		snprintf(activity,
 				 sizeof(activity),
-				 "Waiting for current transactions to finish (waiting for %u)",
+				 "Waiting for transactions older than %u to end",
 				 waitforxid);
 		pgstat_report_activity(STATE_RUNNING, activity);
 
@@ -1434,7 +1426,7 @@ FreeDatabaseList(List *dblist)
  * BuildRelationList
  *		Compile a list of relations in the database
  *
- * Returns a list of OIDs for the request relation types. If temp_relations
+ * Returns a list of OIDs for the requested relation types. If temp_relations
  * is True then only temporary relations are returned. If temp_relations is
  * False then non-temporary relations which have data checksums are returned.
  * If include_shared is True then shared relations are included as well in a
@@ -1515,6 +1507,7 @@ DataChecksumsWorkerMain(Datum arg)
 	BufferAccessStrategy strategy;
 	bool		aborted = false;
 	int64		rels_done;
+	bool		process_shared;
 #ifdef USE_INJECTION_POINTS
 	bool		retried = false;
 #endif
@@ -1538,10 +1531,13 @@ DataChecksumsWorkerMain(Datum arg)
 
 	/*
 	 * Get a list of all temp tables present as we start in this database. We
-	 * need to wait until they are all gone until we are done, since we cannot
-	 * access these relations and modify them.
+	 * need to wait until they are all gone before we exit.  For the list of
+	 * relations to enable checksums in, check if shared catalogs have been
+	 * processed already.
 	 */
 	InitialTempTableList = BuildRelationList(true, false);
+	LWLockAcquire(DataChecksumsWorkerLock, LW_EXCLUSIVE);
+	process_shared = DataChecksumState->process_shared_catalogs;
 
 	/*
 	 * Enable vacuum cost delay, if any.  While this process isn't doing any
@@ -1555,6 +1551,7 @@ DataChecksumsWorkerMain(Datum arg)
 	 */
 	VacuumCostDelay = DataChecksumState->cost_delay;
 	VacuumCostLimit = DataChecksumState->cost_limit;
+	LWLockRelease(DataChecksumsWorkerLock);
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
 
@@ -1563,8 +1560,7 @@ DataChecksumsWorkerMain(Datum arg)
 	 */
 	strategy = GetAccessStrategy(BAS_VACUUM);
 
-	RelationList = BuildRelationList(false,
-									 DataChecksumState->process_shared_catalogs);
+	RelationList = BuildRelationList(false, process_shared);
 
 	/* Update the total number of relations to be processed in this DB. */
 	{

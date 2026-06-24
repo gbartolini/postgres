@@ -2455,9 +2455,6 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 				written = pg_pwrite(openLogFile, from, nleft, startoffset);
 				pgstat_report_wait_end();
 
-				pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_NORMAL,
-										IOOP_WRITE, start, 1, written);
-
 				if (written <= 0)
 				{
 					char		xlogfname[MAXFNAMELEN];
@@ -2475,6 +2472,9 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 							 errmsg("could not write to log file \"%s\" at offset %u, length %zu: %m",
 									xlogfname, startoffset, nleft)));
 				}
+
+				pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_NORMAL,
+										IOOP_WRITE, start, 1, written);
 				nleft -= written;
 				from += written;
 				startoffset += written;
@@ -3331,14 +3331,6 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
 	}
 	pgstat_report_wait_end();
 
-	/*
-	 * A full segment worth of data is written when using wal_init_zero. One
-	 * byte is written when not using it.
-	 */
-	pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_INIT, IOOP_WRITE,
-							io_start, 1,
-							wal_init_zero ? wal_segment_size : 1);
-
 	if (save_errno)
 	{
 		/*
@@ -3354,6 +3346,14 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
 				(errcode_for_file_access(),
 				 errmsg("could not write to file \"%s\": %m", tmppath)));
 	}
+
+	/*
+	 * A full segment worth of data is written when using wal_init_zero. One
+	 * byte is written when not using it.
+	 */
+	pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_INIT, IOOP_WRITE,
+							io_start, 1,
+							wal_init_zero ? wal_segment_size : 1);
 
 	/* Measure I/O timing when flushing segment */
 	io_start = pgstat_prepare_io_time(track_wal_io_timing);
@@ -4807,9 +4807,8 @@ SetDataChecksumsOn(void)
 
 	/*
 	 * The only allowed state transition to "on" is from "inprogress-on" since
-	 * that state ensures that all pages will have data checksums written.  No
-	 * such state transition exists, if it does happen it's likely due to a
-	 * programmer error.
+	 * that state ensures that all pages will have data checksums written. Any
+	 * other attempted state transition is likely due to a programmer error.
 	 */
 	if (XLogCtl->data_checksum_version != PG_DATA_CHECKSUM_INPROGRESS_ON)
 	{
@@ -6572,6 +6571,8 @@ StartupXLOG(void)
 	if (ArchiveRecoveryRequested)
 		CleanupAfterArchiveRecovery(EndOfLogTLI, EndOfLog, newTLI);
 
+	INJECTION_POINT("promotion-after-wal-segment-cleanup", NULL);
+
 	/*
 	 * Local WAL inserts enabled, so it's time to finish initialization of
 	 * commit timestamp.
@@ -6610,6 +6611,7 @@ StartupXLOG(void)
 		SetLocalDataChecksumState(XLogCtl->data_checksum_version);
 		SpinLockRelease(&XLogCtl->info_lck);
 
+		EmitAndWaitDataChecksumsBarrier(PG_DATA_CHECKSUM_OFF);
 		ereport(WARNING,
 				errmsg("enabling data checksums was interrupted"),
 				errhint("Data checksum processing must be manually restarted for checksums to be enabled."));
@@ -6621,7 +6623,7 @@ StartupXLOG(void)
 	 * checksums and we can move to off instead of prompting the user to
 	 * perform any action.
 	 */
-	if (XLogCtl->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_OFF)
+	else if (XLogCtl->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_OFF)
 	{
 		XLogChecksums(PG_DATA_CHECKSUM_OFF);
 
@@ -6629,6 +6631,8 @@ StartupXLOG(void)
 		XLogCtl->data_checksum_version = PG_DATA_CHECKSUM_OFF;
 		SetLocalDataChecksumState(XLogCtl->data_checksum_version);
 		SpinLockRelease(&XLogCtl->info_lck);
+
+		EmitAndWaitDataChecksumsBarrier(PG_DATA_CHECKSUM_OFF);
 	}
 
 	/*

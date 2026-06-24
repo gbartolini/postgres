@@ -351,6 +351,13 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 					 errmsg("OVER specified, but %s is not a window function nor an aggregate function",
 							NameListToString(funcname)),
 					 parser_errposition(pstate, location)));
+		if (ignore_nulls != NO_NULLTREATMENT)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+			/*- translator: first %s is a null treatment option, eg IGNORE NULLS */
+					 errmsg("%s specified, but %s is not a window function",
+							"RESPECT/IGNORE NULLS", NameListToString(funcname)),
+					 parser_errposition(pstate, location)));
 	}
 
 	/*
@@ -520,13 +527,13 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 								NameListToString(funcname)),
 						 parser_errposition(pstate, location)));
 
-			/* It also can't treat nulls as a window function */
-			if (ignore_nulls != NO_NULLTREATMENT)
-				ereport(ERROR,
-						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						 errmsg("aggregate functions do not accept RESPECT/IGNORE NULLS"),
-						 parser_errposition(pstate, location)));
 		}
+
+		if (ignore_nulls != NO_NULLTREATMENT)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("aggregate functions do not accept RESPECT/IGNORE NULLS"),
+					 parser_errposition(pstate, location)));
 	}
 	else if (fdresult == FUNCDETAIL_WINDOWFUNC)
 	{
@@ -2056,9 +2063,7 @@ ParseComplexProjection(ParseState *pstate, const char *funcname, Node *first_arg
 	{
 		ParseNamespaceItem *nsitem;
 
-		nsitem = GetNSItemByRangeTablePosn(pstate,
-										   ((Var *) first_arg)->varno,
-										   ((Var *) first_arg)->varlevelsup);
+		nsitem = GetNSItemByVar(pstate, (Var *) first_arg);
 		/* Return a Var if funcname matches a column, else NULL */
 		return scanNSItemForColumn(pstate, nsitem,
 								   ((Var *) first_arg)->varlevelsup,

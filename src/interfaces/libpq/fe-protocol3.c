@@ -42,7 +42,8 @@
 	 (id) == PqMsg_FunctionCallResponse || \
 	 (id) == PqMsg_NoticeResponse || \
 	 (id) == PqMsg_NotificationResponse || \
-	 (id) == PqMsg_RowDescription)
+	 (id) == PqMsg_RowDescription || \
+	 (id) == PqMsg_ParameterDescription)
 
 
 static void handleFatalError(PGconn *conn);
@@ -1560,7 +1561,8 @@ pqGetNegotiateProtocolVersion3(PGconn *conn)
 	 */
 	if (expect_test_protocol_negotiation && !found_test_protocol_negotiation)
 	{
-		libpq_append_conn_error(conn, "server did not report the unsupported `_pq_.test_protocol_negotiation` parameter in its protocol negotiation message");
+		libpq_append_conn_error(conn, "server did not report the unsupported \"%s\" parameter in its protocol negotiation message",
+								"_pq_.test_protocol_negotiation");
 		goto failure;
 	}
 
